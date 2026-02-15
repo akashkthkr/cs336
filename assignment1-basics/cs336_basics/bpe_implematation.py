@@ -22,7 +22,7 @@ from collections import defaultdict
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 from multiprocessing import Pool, cpu_count
 
-NUM_THREADS = 2 * 10
+NUM_THREADS = 20
 CHUNK_SIZE = 128 * 1024  # 128KB
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -69,17 +69,19 @@ def compute_bpe_merges(word_freq_pre_tokens: dict[str, int], vocab_dict: dict[in
         word_bytes_list[word] = list(word.encode("utf-8"))
         
     for _ in range(num_merges):
-        max_pair = None
         byte_pairs_freq = defaultdict(int)   
         for word, freq in word_freq_pre_tokens.items():
             temp_word = word_bytes_list[word]
                     
             for i in range(len(temp_word) - 1):
                 byte_pairs_freq[(temp_word[i], temp_word[i+1])] += freq
-                
-        sorted_byte_pairs_freq = sorted(byte_pairs_freq.items(), key=lambda x: (x[1],x[0]), reverse=True)
         
-        max_pair = sorted_byte_pairs_freq[0][0]
+        # Find the max pair: highest frequency, then lexicographically greatest byte tuple for tie-breaking
+        # Uses tuple comparison: (first_token_bytes, second_token_bytes)
+        max_pair = max(
+            byte_pairs_freq.keys(),
+            key=lambda pair: (byte_pairs_freq[pair], (vocab_dict[pair[0]], vocab_dict[pair[1]]))
+        )
         
         first_bytes = vocab_dict[max_pair[0]]
         second_bytes = vocab_dict[max_pair[1]]
@@ -106,29 +108,33 @@ def compute_bpe_merges(word_freq_pre_tokens: dict[str, int], vocab_dict: dict[in
 
 
 def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str]) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    # raise NotImplementedError
     if (vocab_size <= 256 + len(special_tokens)):
         raise ValueError("Vocab size is too small to fit the initial byte vocabulary and special tokens")
-    
     
     vocab_dict = defaultdict(bytes) 
     word_freq_pre_tokens = defaultdict(int)
     for i in range(256):
         vocab_dict[i] = bytes([i])
         
-        
     for sp_token in special_tokens:
         vocab_dict[len(vocab_dict)] = sp_token.encode("utf-8")
-    input_chunking_file = open(input_path, "rb")
-    boundaries = find_chunk_boundaries(input_chunking_file, NUM_THREADS, b"<|endoftext|>")
-    input_chunking_file.close()
     
-    with Pool(processes=NUM_THREADS) as pool:
-        results = pool.starmap(get_word_freq_in_batch_per_thread, [(input_path, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])])
-        
-    for result in results:
-        for word, count in result.items():
-            word_freq_pre_tokens[word] += count
+    # Read entire file
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    
+    # Split on special tokens before pre-tokenization to prevent merging across them
+    if special_tokens:
+        # Create regex pattern to split on special tokens (escape special regex chars)
+        special_pattern = "|".join(re.escape(token) for token in special_tokens)
+        segments = re.split(special_pattern, text)
+    else:
+        segments = [text]
+    
+    # Pre-tokenize each segment separately using the GPT-2 regex pattern
+    for segment in segments:
+        for match in re.finditer(PAT, segment):
+            word_freq_pre_tokens[match.group()] += 1
             
     num_merges = vocab_size - 256 - len(special_tokens)
     merges = compute_bpe_merges(word_freq_pre_tokens, vocab_dict, num_merges)
